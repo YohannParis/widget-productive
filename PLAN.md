@@ -113,7 +113,7 @@ empty project first; the rest fan out.
   issues without sacrificing correctness for Slice 1.
 - Timesheet state field name still unconfirmed; `Timesheet.isEditable` handles nil status.
 
-## Slice 2 — Prefill & target resolution
+## Slice 2 — Prefill & target resolution ✓
 - **Depends-on:** 1
 - **Deliverable:** `Grid/` — hybrid daily target from capacity (fallback 8h); holiday
   resolution via `holiday_calendar_id` (0h, no entry); last-week carry-forward (worked rows
@@ -123,6 +123,17 @@ empty project first; the rest fan out.
 - **Acceptance:** new week prefills from last week; holiday day shows 0h target; partial
   absence auto-fills remainder; carried row without booking is flagged; no 0h entries created.
 - **SPEC:** Prefill rules.
+
+**Findings (2026-05-28):**
+- Only *approved* absences reduce the worked-hours target; pending absences still render an
+  absence row but do not affect the remaining capacity split.
+- Even-split fallback applies per-day: if no service has a last-week entry for a given weekday,
+  that day falls through to even-split (not carry). A day with carry entries for some services
+  but not others → services without a last-week entry on that day get nothing (not even-split).
+- `buildRowsWithPrefill` is `nonisolated static` (pure function) to allow sync unit tests.
+- Holiday filter (`filter[holiday_calendar_id]`) is unverified; fetch is wrapped in `try?`
+  (same non-fatal pattern as timesheet range filter). Will confirm against live API.
+- Flagged rows (`hasNoActiveBooking == true`) render in orange in the grid label.
 
 ## Slice 3 — Editing
 - **Depends-on:** 2

@@ -306,6 +306,304 @@ import os
 
 // MARK: - APIClient 429 backoff (stub session)
 
+// MARK: - Prefill (Slice 2)
+
+// Helpers: build typed models from minimal JSON without going through live API.
+
+private func makeEntry(id: String, date: String, minutes: Int, serviceID: String?) throws -> TimeEntry {
+    let relJSON: String
+    if let sid = serviceID {
+        relJSON = #", "relationships": {"service": {"data": {"id": "\#(sid)", "type": "services"}}}"#
+    } else {
+        relJSON = ""
+    }
+    let json = #"""
+    {
+      "id": "\#(id)", "type": "time_entries",
+      "attributes": {
+        "date": "\#(date)", "time": \#(minutes), "approved": false, "approved_at": null,
+        "draft": false, "submitted": false, "rejected": false,
+        "rejected_at": null, "rejected_reason": null, "note": null
+      }\#(relJSON)
+    }
+    """#
+    let raw = try JSONDecoder().decode(RawResource.self, from: Data(json.utf8))
+    return try TimeEntry(raw: raw)
+}
+
+private func makeAbsenceBooking(
+    id: String,
+    startedOn: String,
+    endedOn: String,
+    methodID: Int,
+    time: Int?,           // minutes/day for method 1
+    percentage: Int?,     // for method 2
+    totalTime: Int,
+    totalWorkingDays: Int,
+    eventID: String,
+    approved: Bool
+) throws -> Booking {
+    let timeStr = time.map { "\($0)" } ?? "null"
+    let pctStr  = percentage.map { "\($0)" } ?? "null"
+    let approvedAtStr = approved ? "\"2026-01-01T00:00:00.000Z\"" : "null"
+    let json = #"""
+    {
+      "id": "\#(id)", "type": "bookings",
+      "attributes": {
+        "started_on": "\#(startedOn)", "ended_on": "\#(endedOn)",
+        "booking_method_id": \#(methodID), "percentage": \#(pctStr), "time": \#(timeStr),
+        "total_time": \#(totalTime), "total_working_days": \#(totalWorkingDays),
+        "approved": \#(approved), "approved_at": \#(approvedAtStr),
+        "draft": false, "rejected": false, "canceled": false, "stage_type": null, "note": ""
+      },
+      "relationships": {
+        "event": { "data": { "id": "\#(eventID)", "type": "events" } },
+        "service": { "meta": { "included": false } }
+      }
+    }
+    """#
+    let raw = try JSONDecoder().decode(RawResource.self, from: Data(json.utf8))
+    return try Booking(raw: raw)
+}
+
+private func makeBudgetBooking(
+    id: String, startedOn: String, endedOn: String,
+    methodID: Int, percentage: Int?, time: Int?,
+    totalTime: Int, totalWorkingDays: Int,
+    serviceID: String
+) throws -> Booking {
+    let timeStr = time.map { "\($0)" } ?? "null"
+    let pctStr  = percentage.map { "\($0)" } ?? "null"
+    let json = #"""
+    {
+      "id": "\#(id)", "type": "bookings",
+      "attributes": {
+        "started_on": "\#(startedOn)", "ended_on": "\#(endedOn)",
+        "booking_method_id": \#(methodID), "percentage": \#(pctStr), "time": \#(timeStr),
+        "total_time": \#(totalTime), "total_working_days": \#(totalWorkingDays),
+        "approved": true, "approved_at": "2026-01-01T00:00:00.000Z",
+        "draft": false, "rejected": false, "canceled": false, "stage_type": 2, "note": ""
+      },
+      "relationships": {
+        "event": { "data": null },
+        "service": { "data": { "id": "\#(serviceID)", "type": "services" } }
+      }
+    }
+    """#
+    let raw = try JSONDecoder().decode(RawResource.self, from: Data(json.utf8))
+    return try Booking(raw: raw)
+}
+
+private func makePerson(dailyHours: [Int] = [8, 8, 8, 8, 8, 0, 0]) throws -> Person {
+    let hoursJSON = dailyHours.map { "\($0)" }.joined(separator: ",")
+    let json = #"""
+    {
+      "id": "1", "type": "people",
+      "attributes": {
+        "first_name": "Test", "last_name": "User", "email": "test@example.com",
+        "availabilities": [["2020-01-01", null, [\#(hoursJSON)], 1]]
+      },
+      "relationships": {}
+    }
+    """#
+    let raw = try JSONDecoder().decode(RawResource.self, from: Data(json.utf8))
+    return try Person(raw: raw)
+}
+
+// Week: Mon 2026-06-01 … Fri 2026-06-05
+private let w = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"]
+// Last week: Mon 2026-05-25 … Fri 2026-05-29
+private let lw = ["2026-05-25", "2026-05-26", "2026-05-27", "2026-05-28", "2026-05-29"]
+
+@Test func prefill_serverWinsOverCarryForward() throws {
+    let person = try makePerson()
+    // Server has 300 min on Mon for service "A"
+    let serverEntry = try makeEntry(id: "e1", date: w[0], minutes: 300, serviceID: "A")
+    // Last week had 480 min on Mon for service "A"
+    let lwEntry = try makeEntry(id: "e2", date: lw[0], minutes: 480, serviceID: "A")
+    let budget  = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [serverEntry], lastWeekEntries: [lwEntry],
+        bookings: [budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "Service A"], eventNames: [:], holidayDates: [], person: person
+    )
+    let row = try #require(rows.first { $0.id == "w:A" })
+    #expect(row.minutesByDate[w[0]] == 300)   // server wins
+    #expect(row.minutesByDate[w[1]] == 480)   // carry-forward on other days
+}
+
+@Test func prefill_carryForwardFromLastWeek() throws {
+    let person = try makePerson()
+    let lwEntry = try makeEntry(id: "e1", date: lw[2], minutes: 360, serviceID: "A")  // Wed
+    let budget  = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [lwEntry],
+        bookings: [budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: [:], eventNames: [:], holidayDates: [], person: person
+    )
+    let row = try #require(rows.first { $0.id == "w:A" })
+    #expect(row.minutesByDate[w[2]] == 360)   // Wed carried forward
+    // Mon: last week had no entries for any service → even-split fallback = 480/1 = 480
+    #expect(row.minutesByDate[w[0]] == 480)
+}
+
+@Test func prefill_holidayDayHasNoEntry() throws {
+    let person  = try makePerson()
+    let lwEntry = try makeEntry(id: "e1", date: lw[0], minutes: 480, serviceID: "A")
+    let budget  = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [lwEntry],
+        bookings: [budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: [:], eventNames: [:], holidayDates: [w[0]], person: person
+    )
+    let row = try #require(rows.first { $0.id == "w:A" })
+    #expect(row.minutesByDate[w[0]] == nil)   // Mon is a holiday — no entry
+    #expect(row.minutesByDate[w[1]] == 480)   // Tue carries normally
+}
+
+@Test func prefill_partialApprovedAbsenceEvenSplit() throws {
+    let person = try makePerson()   // 480 min/day
+    // Approved half-day absence on Mon (240 min)
+    let absence = try makeAbsenceBooking(
+        id: "ab1", startedOn: w[0], endedOn: w[0],
+        methodID: 1, time: 240, percentage: nil,
+        totalTime: 240, totalWorkingDays: 1,
+        eventID: "ev1", approved: true
+    )
+    let budgetA = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let budgetB = try makeBudgetBooking(id: "b2", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "B")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [],
+        bookings: [absence, budgetA, budgetB], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "A", "B": "B"], eventNames: ["ev1": "Care Day"],
+        holidayDates: [], person: person
+    )
+    let rowA = try #require(rows.first { $0.id == "w:A" })
+    let rowB = try #require(rows.first { $0.id == "w:B" })
+    // remaining = 480 - 240 = 240; split = 240 / 2 = 120 each
+    #expect(rowA.minutesByDate[w[0]] == 120)
+    #expect(rowB.minutesByDate[w[0]] == 120)
+}
+
+@Test func prefill_fullApprovedAbsenceNoWorkedPrefill() throws {
+    let person = try makePerson()   // 480 min/day
+    // Approved full-day absence on Mon
+    let absence = try makeAbsenceBooking(
+        id: "ab1", startedOn: w[0], endedOn: w[0],
+        methodID: 2, time: nil, percentage: 100,
+        totalTime: 480, totalWorkingDays: 1,
+        eventID: "ev1", approved: true
+    )
+    let budget = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                       methodID: 2, percentage: 100, time: nil,
+                                       totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [],
+        bookings: [absence, budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "A"], eventNames: ["ev1": "Vacation"],
+        holidayDates: [], person: person
+    )
+    let workedRow = rows.first { $0.id == "w:A" }
+    // Mon fully absent → no worked entry; other days even-split from no-carry fallback (one budget svc)
+    #expect(workedRow?.minutesByDate[w[0]] == nil)
+}
+
+@Test func prefill_carriedRowWithoutBookingFlagged() throws {
+    let person  = try makePerson()
+    // Last week had entries for service "A", but this week has no budget booking for it.
+    let lwEntry = try makeEntry(id: "e1", date: lw[0], minutes: 480, serviceID: "A")
+    // Budget booking exists only for service "B" this week.
+    let budgetB = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "B")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [lwEntry],
+        bookings: [budgetB], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "A", "B": "B"], eventNames: [:], holidayDates: [], person: person
+    )
+    let rowA = try #require(rows.first { $0.id == "w:A" })
+    #expect(rowA.hasNoActiveBooking == true)
+    let rowB = try #require(rows.first { $0.id == "w:B" })
+    #expect(rowB.hasNoActiveBooking == false)
+}
+
+@Test func prefill_noZeroMinuteCells() throws {
+    let person = try makePerson(dailyHours: [0, 0, 0, 0, 0, 0, 0])   // 0h every day
+    let lwEntry = try makeEntry(id: "e1", date: lw[0], minutes: 480, serviceID: "A")
+    let budget  = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 0, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [lwEntry],
+        bookings: [budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: [:], eventNames: [:], holidayDates: [], person: person
+    )
+    // Absence-path even-split with remaining=0 should produce no cells.
+    for row in rows where row.id == "w:A" {
+        for mins in row.minutesByDate.values {
+            #expect(mins > 0)
+        }
+    }
+}
+
+@Test func prefill_unapprovedAbsenceDoesNotReduceTarget() throws {
+    let person = try makePerson()   // 480 min/day
+    // Pending (unapproved) absence — should show in absence row but NOT reduce worked target.
+    let pendingAbsence = try makeAbsenceBooking(
+        id: "ab1", startedOn: w[0], endedOn: w[0],
+        methodID: 1, time: 240, percentage: nil,
+        totalTime: 240, totalWorkingDays: 1,
+        eventID: "ev1", approved: false
+    )
+    let budget = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                       methodID: 2, percentage: 100, time: nil,
+                                       totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [],
+        bookings: [pendingAbsence, budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "A"], eventNames: ["ev1": "Care Day"],
+        holidayDates: [], person: person
+    )
+    let workedRow = try #require(rows.first { $0.id == "w:A" })
+    // Unapproved absence does not reduce target → even-split of full 480 min = 480 (one service)
+    #expect(workedRow.minutesByDate[w[0]] == 480)
+    // Absence row still shows the pending booking.
+    let absenceRow = try #require(rows.first { $0.id == "a:ev1" })
+    #expect(absenceRow.minutesByDate[w[0]] == 240)
+}
+
+@Test func prefill_evenSplitFallbackWhenNoLastWeek() throws {
+    let person  = try makePerson()   // 480 min/day
+    let budgetA = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let budgetB = try makeBudgetBooking(id: "b2", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "B")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [],   // no last-week data
+        bookings: [budgetA, budgetB], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "A", "B": "B"], eventNames: [:], holidayDates: [], person: person
+    )
+    let rowA = try #require(rows.first { $0.id == "w:A" })
+    let rowB = try #require(rows.first { $0.id == "w:B" })
+    // 480 / 2 = 240 each
+    #expect(rowA.minutesByDate[w[0]] == 240)
+    #expect(rowB.minutesByDate[w[0]] == 240)
+}
+
+// MARK: - APIClient 429 backoff (stub session)
+
 @Test func apiClient429Backoff() async throws {
     let counter = OSAllocatedUnfairLock(initialState: 0)
     let session = StubURLSession { _ in

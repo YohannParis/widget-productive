@@ -10,6 +10,8 @@ struct WeekRow: Identifiable {
 
     let kind: Kind
     var minutesByDate: [String: Int] = [:]
+    /// True when this row was carried from last week but has no active budget booking this week.
+    var hasNoActiveBooking: Bool = false
 
     var id: String {
         switch kind {
@@ -106,7 +108,6 @@ final class GridViewModel {
             let personID = try await resolvePersonID()
 
             let dateStrings = weekDates.map(Self.isoDate)
-            // Shift by ±1 day so the filter is inclusive regardless of API semantics.
             let afterDate  = Self.isoDate(Self.shift(weekDates[0], by: -1))
             let beforeDate = Self.isoDate(Self.shift(weekDates[4], by:  1))
 
@@ -136,8 +137,6 @@ final class GridViewModel {
                 as: [RawResource].self
             )
 
-            // Timesheets: try after/before first; 400 means that filter isn't supported —
-            // fall back to one request per weekday using filter[date].
             let timesheets = await fetchTimesheets(
                 personID: personID,
                 weekDates: dateStrings,
@@ -158,13 +157,47 @@ final class GridViewModel {
                 eventNames[r.id] = r.attributes?["name"]?.string ?? r.id
             }
 
+            // Last-week carry-forward (non-fatal)
+            let lastWeekDateObjs = Self.weekDates(offset: weekOffset - 1)
+            let lastWeekDateStrs = lastWeekDateObjs.map(Self.isoDate)
+            let lastAfterDate    = Self.isoDate(Self.shift(lastWeekDateObjs[0], by: -1))
+            let lastBeforeDate   = Self.isoDate(Self.shift(lastWeekDateObjs[4], by:  1))
+
+            let lwEnv = try? await api.get(
+                path: "/time_entries",
+                query: [
+                    .init(name: "filter[person_id]", value: personID),
+                    .init(name: "filter[after]",     value: lastAfterDate),
+                    .init(name: "filter[before]",    value: lastBeforeDate),
+                    .init(name: "include",           value: "service"),
+                    .init(name: "page[size]",        value: "200"),
+                ],
+                as: [RawResource].self
+            )
+            let lastWeekEntries = (try? lwEnv?.data.map { try TimeEntry(raw: $0) }) ?? []
+            for r in (lwEnv?.included ?? []) where r.type == "services" {
+                if serviceNames[r.id] == nil {
+                    serviceNames[r.id] = r.attributes?["name"]?.string ?? r.id
+                }
+            }
+
+            // Holidays (non-fatal; filter param unverified — swallow all errors)
+            let holidayDates = await fetchHolidayDates(
+                calendarID: person.holidayCalendarID,
+                afterDate: afterDate,
+                beforeDate: beforeDate
+            )
+
             self.person = person
-            self.rows = Self.buildRows(
+            self.rows = Self.buildRowsWithPrefill(
                 entries: entries,
+                lastWeekEntries: lastWeekEntries,
                 bookings: bookings,
                 weekDates: dateStrings,
+                lastWeekDates: lastWeekDateStrs,
                 serviceNames: serviceNames,
                 eventNames: eventNames,
+                holidayDates: holidayDates,
                 person: person
             )
             self.timesheetsByDate = Dictionary(
@@ -199,7 +232,6 @@ final class GridViewModel {
     ) async -> [Timesheet] {
         let weekSet = Set(weekDates)
 
-        // Attempt 1: range filter (may return 400 if unsupported).
         do {
             let env = try await api.get(
                 path: "/timesheets",
@@ -211,16 +243,14 @@ final class GridViewModel {
                 ],
                 as: [RawResource].self
             )
-            let result = env.data.compactMap { try? Timesheet(raw: $0) }
+            return env.data.compactMap { try? Timesheet(raw: $0) }
                 .filter { weekSet.contains($0.date) }
-            return result
         } catch APIError.http(let code, _) where code == 400 {
             // Range filter not supported — fall through to per-day requests.
         } catch {
-            return []  // other errors: non-fatal, return empty
+            return []
         }
 
-        // Attempt 2: one request per weekday using filter[date].
         var result: [Timesheet] = []
         for dateStr in weekDates {
             if let env = try? await api.get(
@@ -238,40 +268,160 @@ final class GridViewModel {
         return result
     }
 
-    // MARK: Row assembly
+    // MARK: Holiday fetch (non-fatal)
 
-    private static func buildRows(
+    private func fetchHolidayDates(
+        calendarID: String?,
+        afterDate: String,
+        beforeDate: String
+    ) async -> Set<String> {
+        guard let cid = calendarID, !cid.isEmpty else { return [] }
+        guard let env = try? await api.get(
+            path: "/holidays",
+            query: [
+                .init(name: "filter[holiday_calendar_id]", value: cid),
+                .init(name: "filter[after]",               value: afterDate),
+                .init(name: "filter[before]",              value: beforeDate),
+                .init(name: "page[size]",                  value: "50"),
+            ],
+            as: [RawResource].self
+        ) else { return [] }
+        let holidays = (try? env.data.map { try Holiday(raw: $0) }) ?? []
+        return Set(holidays.map(\.date))
+    }
+
+    // MARK: Row assembly with prefill
+
+    // nonisolated: pure function, no actor state; internal so tests can call it directly.
+    nonisolated static func buildRowsWithPrefill(
         entries: [TimeEntry],
+        lastWeekEntries: [TimeEntry],
         bookings: [Booking],
         weekDates: [String],
+        lastWeekDates: [String],
         serviceNames: [String: String],
         eventNames: [String: String],
+        holidayDates: Set<String>,
         person: Person
     ) -> [WeekRow] {
-        let weekSet = Set(weekDates)
-        var workedMap: [String: WeekRow] = [:]
+        let weekSet     = Set(weekDates)
+        let lastWeekSet = Set(lastWeekDates)
 
-        for entry in entries where weekSet.contains(entry.date) {
-            let sid = entry.serviceID ?? "__no_service__"
-            if workedMap[sid] == nil {
-                let name = serviceNames[sid] ?? sid
-                workedMap[sid] = WeekRow(kind: .worked(serviceID: sid, label: name))
-            }
-            workedMap[sid]!.minutesByDate[entry.date, default: 0] += entry.minutes
-        }
-
+        // 1. Absence rows + approved-absence reduction per date.
+        //    All absence bookings render a row; only *approved* ones reduce the worked target.
+        var absenceMinutesByDate: [String: Int] = [:]
         var absenceMap: [String: WeekRow] = [:]
+
         for booking in bookings where booking.isAbsence {
             guard let eid = booking.eventID else { continue }
             if absenceMap[eid] == nil {
-                let name = eventNames[eid] ?? eid
-                absenceMap[eid] = WeekRow(kind: .absence(eventID: eid, label: name))
+                absenceMap[eid] = WeekRow(kind: .absence(eventID: eid, label: eventNames[eid] ?? eid))
             }
             for (idx, dateStr) in weekDates.enumerated() {
                 guard dateStr >= booking.startedOn, dateStr <= booking.endedOn else { continue }
                 let target = person.dailyTargetMinutes(weekday: idx, on: dateStr)
-                absenceMap[eid]!.minutesByDate[dateStr, default: 0] += booking.dailyMinutes(target: target)
+                let mins = booking.dailyMinutes(target: target)
+                guard mins > 0 else { continue }
+                absenceMap[eid]!.minutesByDate[dateStr, default: 0] += mins
+                if booking.isApprovedAbsence {
+                    absenceMinutesByDate[dateStr, default: 0] += mins
+                }
             }
+        }
+
+        // 2. Active budget booking services (active on at least one selected-week day).
+        var activeBudgetServiceIDs: Set<String> = []
+        for bk in bookings where bk.isBudget {
+            guard let sid = bk.serviceID else { continue }
+            for dateStr in weekDates where dateStr >= bk.startedOn && dateStr <= bk.endedOn {
+                activeBudgetServiceIDs.insert(sid)
+                break
+            }
+        }
+
+        // 3. Server entries for the selected week: serviceID → [date: totalMinutes].
+        var serverIndex: [String: [String: Int]] = [:]
+        for entry in entries where weekSet.contains(entry.date) {
+            let sid = entry.serviceID ?? "__no_service__"
+            serverIndex[sid, default: [:]][entry.date, default: 0] += entry.minutes
+        }
+
+        // 4. Last-week entries: serviceID → [weekdayIndex: totalMinutes].
+        var lastWeekIndex: [String: [Int: Int]] = [:]
+        for entry in lastWeekEntries where lastWeekSet.contains(entry.date) {
+            guard let sid = entry.serviceID, entry.minutes > 0 else { continue }
+            if let idx = lastWeekDates.firstIndex(of: entry.date) {
+                lastWeekIndex[sid, default: [:]][idx, default: 0] += entry.minutes
+            }
+        }
+
+        // 5. All worked service IDs (server + active budget + last-week carry).
+        var allWorkedServiceIDs: Set<String> = Set(serverIndex.keys).subtracting(["__no_service__"])
+        allWorkedServiceIDs.formUnion(activeBudgetServiceIDs)
+        allWorkedServiceIDs.formUnion(Set(lastWeekIndex.keys))
+
+        // 6. Build each worked row with prefill.
+        var workedMap: [String: WeekRow] = [:]
+
+        for sid in allWorkedServiceIDs {
+            var row = WeekRow(kind: .worked(serviceID: sid, label: serviceNames[sid] ?? sid))
+
+            for (idx, dateStr) in weekDates.enumerated() {
+                // Server entry always wins.
+                if let serverMins = serverIndex[sid]?[dateStr] {
+                    if serverMins > 0 { row.minutesByDate[dateStr] = serverMins }
+                    continue
+                }
+
+                // Holiday → no entry.
+                if holidayDates.contains(dateStr) { continue }
+
+                let dailyTarget = person.dailyTargetMinutes(weekday: idx, on: dateStr)
+                let absenceMins = absenceMinutesByDate[dateStr] ?? 0
+                let remaining   = max(0, dailyTarget - absenceMins)
+                guard remaining > 0 else { continue }
+
+                if absenceMins > 0 {
+                    // Partial approved absence: even-split remaining across active budget services.
+                    guard activeBudgetServiceIDs.contains(sid),
+                          !activeBudgetServiceIDs.isEmpty else { continue }
+                    let split = remaining / activeBudgetServiceIDs.count
+                    if split > 0 { row.minutesByDate[dateStr] = split }
+                } else {
+                    // No absence: carry-forward if last week has any entries for this weekday.
+                    let anyCarry = lastWeekIndex.values.contains { $0[idx, default: 0] > 0 }
+                    if anyCarry {
+                        if let lw = lastWeekIndex[sid]?[idx], lw > 0 {
+                            row.minutesByDate[dateStr] = lw
+                        }
+                        // Services with no last-week entry on this weekday get nothing on carry days.
+                    } else {
+                        // Even-split fallback across active budget booking services.
+                        guard activeBudgetServiceIDs.contains(sid),
+                              !activeBudgetServiceIDs.isEmpty else { continue }
+                        let split = remaining / activeBudgetServiceIDs.count
+                        if split > 0 { row.minutesByDate[dateStr] = split }
+                    }
+                }
+            }
+
+            let hasServerData = serverIndex[sid] != nil
+            let isActive      = activeBudgetServiceIDs.contains(sid)
+            let wasCarried    = lastWeekIndex[sid] != nil
+
+            if hasServerData || isActive || wasCarried {
+                row.hasNoActiveBooking = !isActive && wasCarried
+                workedMap[sid] = row
+            }
+        }
+
+        // Pass through any entries with no service (edge case, no prefill).
+        if let noSvcDates = serverIndex["__no_service__"] {
+            var row = WeekRow(kind: .worked(serviceID: "__no_service__", label: "Unknown service"))
+            for (dateStr, mins) in noSvcDates where mins > 0 {
+                row.minutesByDate[dateStr] = mins
+            }
+            if !row.minutesByDate.isEmpty { workedMap["__no_service__"] = row }
         }
 
         return workedMap.values.sorted { $0.label < $1.label }

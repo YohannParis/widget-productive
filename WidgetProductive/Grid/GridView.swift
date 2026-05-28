@@ -126,6 +126,7 @@ struct GridView: View {
             Text(row.label)
                 .font(.caption)
                 .lineLimit(2)
+                .foregroundStyle(row.hasNoActiveBooking ? Color.orange : Color.primary)
                 .frame(width: Layout.labelWidth, alignment: .leading)
             ForEach(vm.weekDates, id: \.timeIntervalSinceReferenceDate) { date in
                 let dateStr = GridViewModel.isoDate(date)
