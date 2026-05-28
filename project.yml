@@ -39,7 +39,27 @@ targets:
       base:
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: paris.yohann.WidgetProductiveTests
+  # Slice 0.5 — throwaway CLI probe, not shipped
+  ProductiveProbe:
+    type: tool
+    platform: macOS
+    sources:
+      - path: WidgetProductive/Secrets
+      - path: WidgetProductive/API
+      - path: Probes
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_NAME: productive-probe
+        PRODUCT_BUNDLE_IDENTIFIER: paris.yohann.ProductiveProbe
+        SWIFT_STRICT_CONCURRENCY: complete
 schemes:
+  ProductiveProbe:
+    build:
+      targets:
+        ProductiveProbe: all
+    run:
+      executable: ProductiveProbe
   WidgetProductive:
     build:
       targets:
