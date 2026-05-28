@@ -602,6 +602,147 @@ private let lw = ["2026-05-25", "2026-05-26", "2026-05-27", "2026-05-28", "2026-
     #expect(rowB.minutesByDate[w[0]] == 240)
 }
 
+// MARK: - Editing (Slice 3)
+
+// Helpers for building a minimal GridViewModel-like structure from test data.
+// We test the nonisolated static helpers directly; GridViewModel.update/floor methods
+// are MainActor but are simple enough to verify via @MainActor test functions.
+
+private func makeLockedEntry(id: String, date: String, minutes: Int, serviceID: String) throws -> TimeEntry {
+    let json = #"""
+    {
+      "id": "\#(id)", "type": "time_entries",
+      "attributes": {
+        "date": "\#(date)", "time": \#(minutes),
+        "approved": true, "approved_at": "2026-01-01T00:00:00.000Z",
+        "draft": false, "submitted": false, "rejected": false,
+        "rejected_at": null, "rejected_reason": null, "note": null
+      },
+      "relationships": {
+        "service": { "data": { "id": "\#(serviceID)", "type": "services" } }
+      }
+    }
+    """#
+    let raw = try JSONDecoder().decode(RawResource.self, from: Data(json.utf8))
+    return try TimeEntry(raw: raw)
+}
+
+@Test func editing_lockedFloorInRow() throws {
+    let person = try makePerson()
+    // A locked 3h entry on Mon for service A.
+    let locked  = try makeLockedEntry(id: "e1", date: w[0], minutes: 180, serviceID: "A")
+    let budget  = try makeBudgetBooking(id: "b1", startedOn: w[0], endedOn: w[4],
+                                        methodID: 2, percentage: 100, time: nil,
+                                        totalTime: 2400, totalWorkingDays: 5, serviceID: "A")
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [locked], lastWeekEntries: [],
+        bookings: [budget], weekDates: w, lastWeekDates: lw,
+        serviceNames: ["A": "A"], eventNames: [:], holidayDates: [], person: person
+    )
+    let row = try #require(rows.first { $0.id == "w:A" })
+    #expect(row.lockedFloorByDate[w[0]] == 180)
+    #expect(row.lockedFloorByDate[w[1]] == nil)   // Tue has no locked entry
+}
+
+@Test func editing_approvedAbsenceDatesFlagged() throws {
+    let person = try makePerson()
+    let approved = try makeAbsenceBooking(
+        id: "ab1", startedOn: w[0], endedOn: w[1],
+        methodID: 1, time: 480, percentage: nil,
+        totalTime: 960, totalWorkingDays: 2,
+        eventID: "ev1", approved: true
+    )
+    let pending = try makeAbsenceBooking(
+        id: "ab2", startedOn: w[2], endedOn: w[2],
+        methodID: 1, time: 480, percentage: nil,
+        totalTime: 480, totalWorkingDays: 1,
+        eventID: "ev1", approved: false
+    )
+    let rows = GridViewModel.buildRowsWithPrefill(
+        entries: [], lastWeekEntries: [],
+        bookings: [approved, pending], weekDates: w, lastWeekDates: lw,
+        serviceNames: [:], eventNames: ["ev1": "Care Day"], holidayDates: [], person: person
+    )
+    let row = try #require(rows.first { $0.id == "a:ev1" })
+    #expect(row.approvedAbsenceDates.contains(w[0]))   // Mon approved
+    #expect(row.approvedAbsenceDates.contains(w[1]))   // Tue approved
+    #expect(!row.approvedAbsenceDates.contains(w[2]))  // Wed pending → not in set
+}
+
+@MainActor
+@Test func editing_updateCellClampsToFloor() throws {
+    let vm = GridViewModel()
+    // Manually insert a row with a locked floor.
+    var row = WeekRow(kind: .worked(serviceID: "A", label: "A"))
+    row.minutesByDate[w[0]] = 480
+    row.lockedFloorByDate[w[0]] = 180   // 3h floor
+    vm.rows = [row]
+
+    // Try setting below floor.
+    let stored = vm.updateCell(rowID: "w:A", date: w[0], minutes: 60)
+    #expect(stored == 180)
+    #expect(vm.editsByRowID["w:A"]?[w[0]] == 180)
+
+    // Setting above floor works.
+    let stored2 = vm.updateCell(rowID: "w:A", date: w[0], minutes: 360)
+    #expect(stored2 == 360)
+}
+
+@MainActor
+@Test func editing_dailyTotalSumsWorkedRowsOnly() throws {
+    let vm = GridViewModel()
+    var workedRow = WeekRow(kind: .worked(serviceID: "A", label: "A"))
+    workedRow.minutesByDate[w[0]] = 300
+    var absenceRow = WeekRow(kind: .absence(eventID: "ev1", label: "Care Day"))
+    absenceRow.minutesByDate[w[0]] = 240
+    vm.rows = [workedRow, absenceRow]
+
+    // Total includes only worked rows.
+    #expect(vm.dailyTotalMinutes(date: w[0]) == 300)
+}
+
+@MainActor
+@Test func editing_dailyWarningOverUnder() throws {
+    let vm = GridViewModel()
+    // 8h person
+    let personJSON = #"""
+    {
+      "id": "1", "type": "people",
+      "attributes": {
+        "first_name": "T", "last_name": "U", "email": "t@u.com",
+        "availabilities": [["2020-01-01", null, [8,8,8,8,8,0,0], 1]]
+      }, "relationships": {}
+    }
+    """#
+    let raw = try JSONDecoder().decode(RawResource.self, from: Data(personJSON.utf8))
+    vm.person = try Person(raw: raw)
+
+    var row = WeekRow(kind: .worked(serviceID: "A", label: "A"))
+    row.minutesByDate[w[0]] = 540   // 9h → over
+    row.minutesByDate[w[1]] = 360   // 6h → under
+    row.minutesByDate[w[2]] = 480   // 8h → none
+    vm.rows = [row]
+
+    #expect(vm.dailyWarning(weekdayIndex: 0, date: w[0]) == .over)
+    #expect(vm.dailyWarning(weekdayIndex: 1, date: w[1]) == .under)
+    #expect(vm.dailyWarning(weekdayIndex: 2, date: w[2]) == .none)
+}
+
+@MainActor
+@Test func editing_cellMinutesPreferEdits() throws {
+    let vm = GridViewModel()
+    var row = WeekRow(kind: .worked(serviceID: "A", label: "A"))
+    row.minutesByDate[w[0]] = 480
+    vm.rows = [row]
+
+    // Before edit: returns server/prefill value.
+    #expect(vm.cellMinutes(rowID: "w:A", date: w[0]) == 480)
+
+    // After edit: returns edited value.
+    vm.updateCell(rowID: "w:A", date: w[0], minutes: 240)
+    #expect(vm.cellMinutes(rowID: "w:A", date: w[0]) == 240)
+}
+
 // MARK: - APIClient 429 backoff (stub session)
 
 @Test func apiClient429Backoff() async throws {

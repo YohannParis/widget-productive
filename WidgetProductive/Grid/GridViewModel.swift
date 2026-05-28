@@ -12,6 +12,12 @@ struct WeekRow: Identifiable {
     var minutesByDate: [String: Int] = [:]
     /// True when this row was carried from last week but has no active budget booking this week.
     var hasNoActiveBooking: Bool = false
+    /// Per-cell sum of individually-approved (locked) entry minutes. Sets a floor the user can't go below.
+    var lockedFloorByDate: [String: Int] = [:]
+    /// Dates where the absence booking is approved — those cells are read-only.
+    var approvedAbsenceDates: Set<String> = []
+    /// True when the row was added locally this session (not yet on the server).
+    var isLocallyAdded: Bool = false
 
     var id: String {
         switch kind {
@@ -25,6 +31,21 @@ struct WeekRow: Identifiable {
         case .worked(_, let l):  return l
         case .absence(_, let l): return l
         }
+    }
+
+    var isAbsence: Bool {
+        if case .absence = kind { return true }
+        return false
+    }
+
+    var serviceID: String? {
+        if case .worked(let sid, _) = kind { return sid }
+        return nil
+    }
+
+    var eventID: String? {
+        if case .absence(let eid, _) = kind { return eid }
+        return nil
     }
 }
 
@@ -54,6 +75,15 @@ final class GridViewModel {
     var person: Person? = nil
     var isLoading = false
     var loadError: String? = nil
+
+    // MARK: Edit state (Slice 3)
+    /// User edits keyed by rowID → date → desired total minutes.
+    /// Key is present only when the user has touched a cell; absence means "use prefill/server value".
+    var editsByRowID: [String: [String: Int]] = [:]
+
+    /// Services available for Add Row. Populated on first open of the add-row panel.
+    var availableServices: [(id: String, label: String)] = []
+    var isLoadingServices = false
 
     private let api = APIClient()
 
@@ -189,6 +219,7 @@ final class GridViewModel {
             )
 
             self.person = person
+            self.editsByRowID = [:]
             self.rows = Self.buildRowsWithPrefill(
                 entries: entries,
                 lastWeekEntries: lastWeekEntries,
@@ -205,6 +236,102 @@ final class GridViewModel {
             )
         } catch {
             loadError = error.localizedDescription
+        }
+    }
+
+    // MARK: Cell editing (Slice 3)
+
+    /// Displayed value for a cell: user edit if present, otherwise server/prefill value.
+    func cellMinutes(rowID: String, date: String) -> Int? {
+        if let edited = editsByRowID[rowID]?[date] { return edited }
+        return rows.first { $0.id == rowID }?.minutesByDate[date]
+    }
+
+    /// Locked floor for the cell (sum of individually approved entries). Zero if none.
+    func lockedFloor(rowID: String, date: String) -> Int {
+        rows.first { $0.id == rowID }?.lockedFloorByDate[date] ?? 0
+    }
+
+    /// True when the cell can be edited by the user.
+    /// Approved-timesheet days and approved-absence cells are read-only; everything else is editable.
+    func isCellEditable(row: WeekRow, date: String) -> Bool {
+        // Approved timesheet day → all cells read-only.
+        if timesheetsByDate[date]?.status == .approved { return false }
+        // Approved absence cells are read-only.
+        if row.isAbsence && row.approvedAbsenceDates.contains(date) { return false }
+        return true
+    }
+
+    /// Set a cell's desired total minutes, clamping to the locked floor.
+    /// Returns the clamped value actually stored.
+    @discardableResult
+    func updateCell(rowID: String, date: String, minutes: Int) -> Int {
+        let floor  = lockedFloor(rowID: rowID, date: date)
+        let clamped = max(floor, minutes)
+        editsByRowID[rowID, default: [:]][date] = clamped
+        return clamped
+    }
+
+    // MARK: Daily totals & warnings (Slice 3)
+
+    enum DayWarning: Equatable {
+        case none, under, over
+    }
+
+    /// Sum of all cell values (worked rows only) for a given date.
+    func dailyTotalMinutes(date: String) -> Int {
+        rows
+            .filter { !$0.isAbsence }
+            .reduce(0) { sum, row in sum + (cellMinutes(rowID: row.id, date: date) ?? 0) }
+    }
+
+    /// Over/under warning for a given date relative to the daily capacity target.
+    func dailyWarning(weekdayIndex: Int, date: String) -> DayWarning {
+        guard let p = person else { return .none }
+        let target = p.dailyTargetMinutes(weekday: weekdayIndex, on: date)
+        guard target > 0 else { return .none }
+        let total  = dailyTotalMinutes(date: date)
+        if total == 0  { return .none }    // nothing entered yet — not a warning
+        if total > target  { return .over }
+        if total < target  { return .under }
+        return .none
+    }
+
+    // MARK: Add Row (Slice 3 — stages locally; Slice 4 writes to server)
+
+    func addWorkedRow(serviceID: String, label: String) {
+        let id = "w:\(serviceID)"
+        guard !rows.contains(where: { $0.id == id }) else { return }
+        var row = WeekRow(kind: .worked(serviceID: serviceID, label: label))
+        row.isLocallyAdded = true
+        rows.append(row)
+    }
+
+    func addAbsenceRow(eventID: String, label: String) {
+        let id = "a:\(eventID)"
+        guard !rows.contains(where: { $0.id == id }) else { return }
+        var row = WeekRow(kind: .absence(eventID: eventID, label: label))
+        row.isLocallyAdded = true
+        rows.append(row)
+    }
+
+    /// Load the service list for the Add Row panel (lazy; no-op if already loaded).
+    func loadAvailableServices() {
+        guard availableServices.isEmpty, !isLoadingServices else { return }
+        isLoadingServices = true
+        Task {
+            defer { isLoadingServices = false }
+            guard let env = try? await api.get(
+                path: "/services",
+                query: [
+                    .init(name: "filter[time_tracking_enabled]", value: "true"),
+                    .init(name: "page[size]", value: "200"),
+                ],
+                as: [RawResource].self
+            ) else { return }
+            let services = (try? env.data.map { try Service(raw: $0) }) ?? []
+            availableServices = services.map { (id: $0.id, label: $0.name) }
+                .sorted { $0.label < $1.label }
         }
     }
 
@@ -325,6 +452,7 @@ final class GridViewModel {
                 absenceMap[eid]!.minutesByDate[dateStr, default: 0] += mins
                 if booking.isApprovedAbsence {
                     absenceMinutesByDate[dateStr, default: 0] += mins
+                    absenceMap[eid]!.approvedAbsenceDates.insert(dateStr)
                 }
             }
         }
@@ -340,10 +468,15 @@ final class GridViewModel {
         }
 
         // 3. Server entries for the selected week: serviceID → [date: totalMinutes].
+        //    Also collect locked (individually approved) floor per (service, date).
         var serverIndex: [String: [String: Int]] = [:]
+        var lockedFloorIndex: [String: [String: Int]] = [:]
         for entry in entries where weekSet.contains(entry.date) {
             let sid = entry.serviceID ?? "__no_service__"
             serverIndex[sid, default: [:]][entry.date, default: 0] += entry.minutes
+            if entry.isLocked {
+                lockedFloorIndex[sid, default: [:]][entry.date, default: 0] += entry.minutes
+            }
         }
 
         // 4. Last-week entries: serviceID → [weekdayIndex: totalMinutes].
@@ -411,6 +544,7 @@ final class GridViewModel {
 
             if hasServerData || isActive || wasCarried {
                 row.hasNoActiveBooking = !isActive && wasCarried
+                row.lockedFloorByDate  = lockedFloorIndex[sid] ?? [:]
                 workedMap[sid] = row
             }
         }

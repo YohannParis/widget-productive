@@ -135,7 +135,7 @@ empty project first; the rest fan out.
   (same non-fatal pattern as timesheet range filter). Will confirm against live API.
 - Flagged rows (`hasNoActiveBooking == true`) render in orange in the grid label.
 
-## Slice 3 — Editing
+## Slice 3 — Editing ✓
 - **Depends-on:** 2
 - **Deliverable:** `Grid/` — decimal-hours input in 0.25h steps (stored as minutes);
   editability by per-day timesheet state; **per-cell approval floor** (clamp-up + inline note,
@@ -145,6 +145,21 @@ empty project first; the rest fan out.
 - **Acceptance:** entering below a locked floor clamps up with note; adding Care Day/Vacation
   creates a pending absence booking; approved cells read-only with working mailto.
 - **SPEC:** Editing rules; App shell & UX (Add rows, Time input).
+
+**Findings (2026-05-28):**
+- Add Row stages locally (new `WeekRow` with `isLocallyAdded = true`); Slice 4 does the actual
+  POST/write as part of the bookings → entries → timesheets write order.
+- Over/under warnings use the daily capacity target (from `person.dailyTargetMinutes`), not literal 8h.
+  A day with `target == 0` (e.g. holiday or 0h availability) never shows a warning.
+- Submitted-day cells are UI-editable (Slice 4 handles the transparent demote-before-write).
+  Only `approved` timesheet status makes all cells read-only on a given day.
+- Approved absence cells (`approvedAbsenceDates`) are read-only independently of timesheet state;
+  they show an explanation + `mailto:` to `ATTENDANCE_EMAIL` on tap.
+- Locked floor (`lockedFloorByDate`) is summed from `isLocked` entries in `buildRowsWithPrefill`;
+  `updateCell` clamps to floor and stores desired total (not delta) in `editsByRowID`.
+- `editsByRowID` is cleared on every `load()` / refresh, so stale edits don't survive a reload.
+- Services list for Add Row loaded lazily from `GET /services?filter[time_tracking_enabled]=true`
+  on first panel open; budget-booking services are pinned at the top of the list.
 
 ## Slice 4 — Submit
 - **Depends-on:** 3
