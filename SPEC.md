@@ -19,16 +19,19 @@ authoritative source for "what the user is planned to work on" is the user's own
 **budget bookings** (see Weekly grid model). The app derives default worked rows from
 budget bookings and caches the resulting project/service/event ids locally to speed up
 later API calls. The `.env`/settings ids are a fallback when bookings cannot be
-resolved.
+resolved. The derived-id cache is refreshed on app launch and manual refresh; it is
+only a lookup shortcut — server data always wins on grid load.
 
 ## Architecture
-- Native macOS app using SwiftUI
-- `MenuBarExtra` menu bar UI
-- Productive API client over `URLSession`
-- Token stored in Keychain in production
-- `.env` may prefill dev settings
+- Native macOS app using SwiftUI, packaged as an **Xcode app bundle**, targeting **macOS 26+**
+  (latest SwiftUI; no back-compatibility constraints)
+- `MenuBarExtra(style: .window)` popover hosts the weekly grid (see App shell & UX)
+- Productive API client over `URLSession` (JSON:API). Writes are issued **sequentially with
+  429/backoff handling** because Productive rate-limits POST/PATCH requests
+- Secrets via build-config switch: `.env` in **DEBUG** builds; **Keychain + Settings UI** in
+  **RELEASE**. Token lives in Keychain in production
 - EventKit for optional calendar sync
-- UserDefaults for non-secret settings and sync metadata
+- UserDefaults for non-secret settings, the derived-id cache, and sync metadata
 
 ## Settings panel
 - Productive token
@@ -38,7 +41,25 @@ resolved.
 - Default service
 - Configurable pinned rows
 - Optional calendar picker, including `None`
-- Reminder time — a local notification fires at this time to review/submit the week
+- Reminder — weekday + time (default **Friday 10:00**). A local notification fires to review/
+  submit the week, deep-links to the current week's popover, and is **suppressed if the week
+  is already fully submitted**
+
+## App shell & UX
+- `MenuBarExtra(style: .window)` popover holds the whole flow: week navigation, grid, submit
+- Grid shows the **workweek only (Mon–Fri)** — no weekend columns
+- Menu bar icon reflects current-week state: plain when fully submitted, a **dot** when
+  unsubmitted weekdays remain, a **warning tint** when a day is rejected
+- Absence balances (`/entitlements`) are shown in the **menu bar icon tooltip**
+  (e.g. `Vacation 12.5d, Care 3`)
+- Data fetch triggers: popover open, manual refresh button, and after a submit (plus a drift
+  refresh immediately before submit). **No background polling.**
+- Add rows via a single **"+ Add row"** control: services from the person's current budget
+  bookings pinned on top, then a searchable list of all trackable services, then `Care Day`
+  / `Vacation`
+- Time input: decimal hours in **0.25h steps**, stored as minutes
+- Auth: if the token is missing or rejected (401), the popover is replaced by a full
+  **setup/connect screen** until a valid token is stored
 
 ## Productive data model
 Three distinct Productive records back the grid; do not conflate them.
@@ -50,7 +71,9 @@ Three distinct Productive records back the grid; do not conflate them.
   - **Absence bookings** reference an `event` (time off / remote work). Care Day and
     Vacation are absence bookings. A booking is a date *range* (`started_on`/`ended_on`)
     with a `booking_method`/`percentage`/`total_time` for partial-day amounts; the grid
-    decomposes a range into per-day cells.
+    decomposes a range into per-day cells, **honoring `booking_method`**:
+    per-day → that day's minutes directly; total-time → divided across the range's working
+    days; percentage → `percentage` × that day's daily target.
 - `timesheets` — the unit of submission, one **per person per day**, moving through
   `draft → submitted → approved / rejected`. There is no weekly timesheet record.
 
@@ -78,10 +101,13 @@ Three distinct Productive records back the grid; do not conflate them.
 
 ## Prefill rules
 - Week navigation supports past, current, and future weeks
-- Default target is 8h Mon–Fri
+- Daily target is **hybrid**: derived from the person's capacity / working-hours schedule
+  when resolvable, otherwise 8h. Workweek is **Mon–Fri only**
 - Primary prefill source is **last week's time entries**: each worked row and its per-day
   hours are carried forward into the selected week (e.g. 8h/day on one service last week
   prefills 8h/day on that service this week)
+- A carried-forward worked row whose service has **no active budget booking** in the selected
+  week is still prefilled, but **flagged** ("no current booking") so the user can decide
 - Care Day and Vacation are **never** carried forward; absence rows reflect only the
   selected week's actual absence bookings
 - Fallback when a day has no last-week value to copy (new budget booking, or first use):
@@ -89,7 +115,8 @@ Three distinct Productive records back the grid; do not conflate them.
   (e.g. two bookings → 4h each)
 - Time entries already on the server for the selected week are the source of truth and
   take precedence over carried-forward values (carry-forward only fills empty cells)
-- Holidays may fall back to Mon–Fri-only logic in v1 if holiday-calendar resolution is awkward
+- Holidays are resolved from the person's assigned `holiday_calendar_id` (`GET /holidays` for
+  the visible window); holiday days get a **0h target and no entry**
 - Approved absences for the selected week reduce that day's worked hours; a partial
   absence auto-fills the remaining hours across the worked rows (even split), and a fully
   absent day sets worked rows to `0` (still editable)
@@ -103,7 +130,8 @@ Three distinct Productive records back the grid; do not conflate them.
 - A locked (individually approved) time entry sets a **per-cell minimum** rather than
   making the cell read-only: the cell stays editable but cannot be reduced below the sum
   of its locked entries. Example: a locked 3.5h entry means that cell can be raised but
-  not set below 3.5h.
+  not set below 3.5h. Entering a lower value **clamps up to the floor** with an inline note
+  (e.g. "min 3.5h (approved)").
 - The app never modifies or deletes a locked entry. Hours above the locked floor are
   written as a separate editable entry — the one exception to one-entry-per-cell.
 - Detect locked entries via per-entry approval (`approved_at` / `deal_time_approval` on
@@ -120,17 +148,24 @@ Three distinct Productive records back the grid; do not conflate them.
 
 ## Submit semantics
 - Single primary action: submit/update
-- Before submit, refresh from server and warn if server drift is detected. Drift = a
-  cell the user did not edit changed on the server since load. Show exactly which
-  cells/days conflict (server vs local) and let the user reload or proceed.
+- Before submit, refresh from server and warn if server drift is detected. Drift detection
+  uses a **per-cell baseline** snapshot taken at load: a cell is "edited" if the user changed
+  it, and drift is an **unedited** cell whose current server value differs from its baseline.
+  The conflict view lists server-vs-local **per cell** with **Reload** (take server, lose local
+  edits there) or **Proceed** (overwrite server with local).
 - Writes use minimal diff: only create/update/delete `time_entries` (and `bookings`)
   for days that actually differ from the server. Do not delete/recreate unchanged rows.
 - Reconcile worked rows via `time_entries`; reconcile absence rows via `bookings`
+- Write order is **bookings → time_entries → timesheets**, issued **sequentially with 429
+  backoff**. Each item is **best-effort**: failures are collected and surfaced at row/cell
+  level, and only failed items are retried (no rollback)
 - Submission is per-day: ensure a daily `timesheet` exists for each workday (Mon–Fri)
   and transition it `draft → submitted`. The single submit action covers the whole
   workweek; days already `approved` are skipped.
 - For a changed day that is already `submitted`, the app demotes it to `draft`, writes the
-  diff, then re-submits it (transparent to the user).
+  diff, then re-submits it (transparent to the user). If a write **fails mid-sequence**, the
+  day is **left in `draft`**, the error is surfaced, and the user retries — no auto re-submit
+  and no rollback.
 - Do not auto-approve time entries or bookings
 - No 0h server entries are created
 - Partial failures should surface row/cell-level errors and allow retry of failed items
@@ -141,9 +176,11 @@ Three distinct Productive records back the grid; do not conflate them.
 - User picks destination calendar from Calendar.app calendars
 - Sync approved vacation only
 - Sync window: past 90 days + next 365 days
-- One all-day spanning event per Productive vacation booking
+- One all-day spanning event per Productive vacation booking, titled **`Vacation`**
 - Keep separate bookings as separate calendar events
 - Store Productive booking id to EventKit identifier mapping in UserDefaults and event notes
+- If the destination calendar is changed, app-created events are removed from the old calendar
+  and recreated in the new one on the next sync (only events the app created)
 - Each sync reconciles the calendar to match approved vacations in the window: create
   events for newly approved bookings, and delete events whose booking is gone or no
   longer approved (only events the app created, tracked via the stored mapping)
@@ -159,6 +196,7 @@ Three distinct Productive records back the grid; do not conflate them.
 - `POST/PATCH/DELETE /api/v2/bookings` — reconcile absence rows (Vacation, Care Day)
 - `GET /api/v2/entitlements` — absence balances
 - `GET /api/v2/events` — absence event discovery
+- `GET /api/v2/holidays` — resolve holidays for the person's assigned `holiday_calendar_id`
 - `GET /api/v2/timesheets` — inspect per-day timesheet state (`draft`/`submitted`/`approved`/`rejected`)
 - `POST/PATCH /api/v2/timesheets` — create/submit the per-day timesheet (transition `draft → submitted`)
 
@@ -172,6 +210,23 @@ Three distinct Productive records back the grid; do not conflate them.
 - Offline editing
 - Bidirectional calendar sync
 - Editing approved vacation/time directly
-- Full holiday-calendar/person-calendar resolution if fallback is enough
+- Person work-schedule resolution beyond the capacity-based daily target
 - WidgetKit companion
 - Distribution/notarization work
+
+## Build plan
+- **Slice 1 (first):** read-only live grid — token from `.env`, `GET /people` (resolve by
+  email), fetch the current week's `time_entries` + `bookings`, render the Mon–Fri grid
+  read-only. Validates the riskiest API assumptions before any write logic.
+- Subsequent slices layer on prefill, editing (incl. the per-cell floor), submit, holiday/
+  capacity resolution, then calendar sync.
+
+## Open verification (validate during Slice 1, against the live API not just docs)
+- **Lock signal** — confirm whether `approved_at` vs `deal_time_approval` is the right
+  per-entry lock flag, using a real individually-approved entry
+- **Timesheet mechanics** — exact create/transition flow and state field name for per-day
+  `draft → submitted` (`POST` to create, `PATCH` to transition)
+- **Capacity exposure** — how per-person daily capacity is actually read (drives the hybrid
+  target and the percentage-booking decomposition)
+- **Floor × drift × minimal-diff interaction** — the two-entries-per-cell case is the hotspot:
+  baseline = locked floor + editable amount, and a changed approval can itself look like drift
