@@ -222,11 +222,33 @@ Three distinct Productive records back the grid; do not conflate them.
   capacity resolution, then calendar sync.
 
 ## Open verification (validate during Slice 1, against the live API not just docs)
-- **Lock signal** — confirm whether `approved_at` vs `deal_time_approval` is the right
-  per-entry lock flag, using a real individually-approved entry
-- **Timesheet mechanics** — exact create/transition flow and state field name for per-day
-  `draft → submitted` (`POST` to create, `PATCH` to transition)
-- **Capacity exposure** — how per-person daily capacity is actually read (drives the hybrid
-  target and the percentage-booking decomposition)
+
+### Confirmed (Slice 0.5 probe, 2026-05-28)
+
+- **Lock signal** — `approved_at` (string ISO8601 timestamp, `null` when not locked) is the
+  correct per-entry lock field. `approved` (bool) is also present and moves together. There is
+  no `deal_time_approval` field on `time_entries`. Implementation: `isLocked = approved_at != null`.
+- **Capacity exposure** — `availabilities` attribute on `GET /people/{id}`. Format:
+  `[[start_date, end_date|null, [h_mon, h_tue, h_wed, h_thu, h_fri, h_sat, h_sun, ...], schedule_id], ...]`
+  where hours are integers (e.g. `[8, 8, 8, 8, 8, 0, 0]` = Mon–Fri 8h). Supports biweekly
+  schedules (14-element array); index with `weekday % array.count`. Daily target in minutes =
+  `hours[weekday] * 60`. No external include needed; field is present on the base person record.
+- **Booking decomposition** — field is `booking_method_id` (integer, not a string):
+  - `1` = per-day: `time` field (minutes/day) gives the per-day amount directly.
+  - `2` = percentage: `percentage` field × daily target ÷ 100. Field is an integer (e.g. `100`).
+  - Fallback (unknown method): `total_time / total_working_days`.
+  `hours` field (decimal hours/day) mirrors `time` for method 1 but is null for method 2.
+- **Date range filter syntax** — `filter[date][gte/lte]` and `filter[date_from/date_to]` are
+  both rejected (400) on `/time_entries`, `/timesheets`, and `/bookings`. Correct filter param
+  names are still unknown; to be resolved at the start of Slice 1.
+
+### Still open
+
+- **Timesheet state field** — Probe returned only `date` + `created_at` attributes (no
+  `status` or `state`). The state field name and transition payload for `draft → submitted`
+  need to be confirmed against a live submitted/approved timesheet in Slice 4.
+- **Date range filter** — correct filter param names for `/time_entries`, `/timesheets`, and
+  `/bookings` are unknown. Must discover at the start of Slice 1 before fetching weekly data.
 - **Floor × drift × minimal-diff interaction** — the two-entries-per-cell case is the hotspot:
-  baseline = locked floor + editable amount, and a changed approval can itself look like drift
+  baseline = locked floor + editable amount, and a changed approval can itself look like drift.
+  Verify during Slice 3–4 implementation.

@@ -10,3 +10,4 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 .swiftpm/
+Probes/findings/*

@@ -153,9 +153,10 @@ private extension Secrets {
 
     static func loadDotenv() throws -> [String: String] {
         if let cached = _dotenvCache { return cached }
-        // Walk up from the bundle to find .env at the project root.
         let fm = FileManager.default
-        var dir = Bundle.main.bundlePath
+
+        // 1. Walk up from CWD (reliable for CLI tools run from the project root).
+        var dir = fm.currentDirectoryPath
         for _ in 0..<8 {
             let candidate = (dir as NSString).appendingPathComponent(".env")
             if fm.fileExists(atPath: candidate) {
@@ -165,10 +166,23 @@ private extension Secrets {
             }
             dir = (dir as NSString).deletingLastPathComponent
         }
-        // Fallback: project root relative to source file
-        let sourceDir = URL(filePath: #file).deletingLastPathComponent()
-                                            .deletingLastPathComponent()
-                                            .deletingLastPathComponent()
+
+        // 2. Walk up from bundle (works for app bundle in DerivedData layout).
+        dir = Bundle.main.bundlePath
+        for _ in 0..<8 {
+            let candidate = (dir as NSString).appendingPathComponent(".env")
+            if fm.fileExists(atPath: candidate) {
+                let parsed = try parseDotenv(at: candidate)
+                _dotenvCache = parsed
+                return parsed
+            }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+
+        // 3. Source-relative fallback using #filePath (absolute at compile time).
+        let sourceDir = URL(filePath: #filePath).deletingLastPathComponent()
+                                                .deletingLastPathComponent()
+                                                .deletingLastPathComponent()
         let candidate = sourceDir.appending(path: ".env").path(percentEncoded: false)
         if fm.fileExists(atPath: candidate) {
             let parsed = try parseDotenv(at: candidate)

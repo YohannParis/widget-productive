@@ -19,7 +19,7 @@ struct Probe {
     init() {
         self.client = APIClient()
         // Write findings next to this source file.
-        let src = URL(filePath: #file).deletingLastPathComponent()
+        let src = URL(filePath: #filePath).deletingLastPathComponent()
         self.findingsDir = src.appending(path: "findings")
     }
 
@@ -86,100 +86,169 @@ struct Probe {
 
     func probeTimeEntries(personID: String, start: String, end: String) async {
         print("--- Time entries (\(start) – \(end)) ---")
+        // First try with date_from/date_to range filters
+        var succeeded = false
         await probeEndpoint(
             path: "/time_entries",
             query: [
                 URLQueryItem(name: "filter[person_id]", value: personID),
-                URLQueryItem(name: "filter[date][gte]", value: start),
-                URLQueryItem(name: "filter[date][lte]", value: end),
+                URLQueryItem(name: "filter[date_from]", value: start),
+                URLQueryItem(name: "filter[date_to]", value: end),
                 URLQueryItem(name: "include", value: "service,project"),
                 URLQueryItem(name: "page[size]", value: "200")
             ],
             filename: "time_entries.json",
             summary: { json in
+                succeeded = true
                 let entries = (json["data"] as? [[String: Any]]) ?? []
-                print("  \(entries.count) time entries")
+                print("  \(entries.count) time entries (filter: date_from/date_to)")
                 for e in entries.prefix(3) {
                     let attrs = e["attributes"] as? [String: Any]
-                    // Probe the lock signal fields
-                    let approvedAt    = attrs?["approved_at"]
+                    let approvedAt       = attrs?["approved_at"]
                     let dealTimeApproval = attrs?["deal_time_approval"]
-                    let date          = attrs?["date"] ?? "?"
-                    let minutes       = attrs?["time"] ?? attrs?["minutes"] ?? "?"
+                    let date             = attrs?["date"] ?? "?"
+                    let minutes          = attrs?["time"] ?? attrs?["minutes"] ?? "?"
                     print("  entry \(e["id"] ?? "?") date=\(date) minutes=\(minutes) approved_at=\(String(describing: approvedAt)) deal_time_approval=\(String(describing: dealTimeApproval))")
                 }
             }
         )
+        // Fallback: no date filter — get any recent entries for shape inspection
+        if !succeeded {
+            print("  (date_from/date_to failed, retrying without date filter)")
+            await probeEndpoint(
+                path: "/time_entries",
+                query: [
+                    URLQueryItem(name: "filter[person_id]", value: personID),
+                    URLQueryItem(name: "include", value: "service,project"),
+                    URLQueryItem(name: "page[size]", value: "5")
+                ],
+                filename: "time_entries.json",
+                summary: { json in
+                    let entries = (json["data"] as? [[String: Any]]) ?? []
+                    print("  \(entries.count) time entries (no date filter)")
+                    for e in entries.prefix(3) {
+                        let attrs = e["attributes"] as? [String: Any]
+                        print("  entry \(e["id"] ?? "?") attrs-keys=\(Array((attrs ?? [:]).keys).sorted())")
+                        if let attrs { print("  -> \(attrs)") }
+                    }
+                }
+            )
+        }
     }
 
     // MARK: - Timesheets
 
     func probeTimesheets(personID: String, start: String, end: String) async {
         print("--- Timesheets (\(start) – \(end)) ---")
+        var succeeded = false
         await probeEndpoint(
             path: "/timesheets",
             query: [
                 URLQueryItem(name: "filter[person_id]", value: personID),
-                URLQueryItem(name: "filter[date][gte]", value: start),
-                URLQueryItem(name: "filter[date][lte]", value: end),
+                URLQueryItem(name: "filter[date_from]", value: start),
+                URLQueryItem(name: "filter[date_to]", value: end),
                 URLQueryItem(name: "page[size]", value: "200")
             ],
             filename: "timesheets.json",
             summary: { json in
+                succeeded = true
                 let sheets = (json["data"] as? [[String: Any]]) ?? []
-                print("  \(sheets.count) timesheets")
+                print("  \(sheets.count) timesheets (filter: date_from/date_to)")
                 for s in sheets {
                     let attrs = s["attributes"] as? [String: Any]
-                    // Probe: state field name, date field name
                     print("  timesheet \(s["id"] ?? "?") attrs-keys=\(Array((attrs ?? [:]).keys).sorted())")
                     if let attrs { print("  -> \(attrs)") }
                 }
             }
         )
+        if !succeeded {
+            print("  (date_from/date_to failed, retrying without date filter)")
+            await probeEndpoint(
+                path: "/timesheets",
+                query: [
+                    URLQueryItem(name: "filter[person_id]", value: personID),
+                    URLQueryItem(name: "page[size]", value: "5")
+                ],
+                filename: "timesheets.json",
+                summary: { json in
+                    let sheets = (json["data"] as? [[String: Any]]) ?? []
+                    print("  \(sheets.count) timesheets (no date filter)")
+                    for s in sheets {
+                        let attrs = s["attributes"] as? [String: Any]
+                        print("  timesheet \(s["id"] ?? "?") attrs-keys=\(Array((attrs ?? [:]).keys).sorted())")
+                        if let attrs { print("  -> \(attrs)") }
+                    }
+                }
+            )
+        }
     }
 
     // MARK: - Bookings
 
     func probeBookings(personID: String, start: String, end: String) async {
         print("--- Bookings (\(start) – \(end)) ---")
+        var succeeded = false
         await probeEndpoint(
             path: "/bookings",
             query: [
                 URLQueryItem(name: "filter[person_id]", value: personID),
-                URLQueryItem(name: "filter[started_on][gte]", value: start),
-                URLQueryItem(name: "filter[ended_on][lte]", value: end),
+                URLQueryItem(name: "filter[date_from]", value: start),
+                URLQueryItem(name: "filter[date_to]", value: end),
                 URLQueryItem(name: "include", value: "event,service"),
                 URLQueryItem(name: "page[size]", value: "200")
             ],
             filename: "bookings.json",
             summary: { json in
+                succeeded = true
                 let bookings = (json["data"] as? [[String: Any]]) ?? []
-                print("  \(bookings.count) bookings")
+                print("  \(bookings.count) bookings (filter: date_from/date_to)")
                 for b in bookings.prefix(5) {
                     let attrs = b["attributes"] as? [String: Any]
                     print("  booking \(b["id"] ?? "?") booking_method=\(attrs?["booking_method"] ?? "?") percentage=\(attrs?["percentage"] ?? "?") total_time=\(attrs?["total_time"] ?? "?")")
                 }
             }
         )
+        if !succeeded {
+            print("  (date_from/date_to failed, retrying without date filter)")
+            await probeEndpoint(
+                path: "/bookings",
+                query: [
+                    URLQueryItem(name: "filter[person_id]", value: personID),
+                    URLQueryItem(name: "include", value: "event,service"),
+                    URLQueryItem(name: "page[size]", value: "10")
+                ],
+                filename: "bookings.json",
+                summary: { json in
+                    let bookings = (json["data"] as? [[String: Any]]) ?? []
+                    print("  \(bookings.count) bookings (no date filter)")
+                    for b in bookings.prefix(5) {
+                        let attrs = b["attributes"] as? [String: Any]
+                        print("  booking \(b["id"] ?? "?") attrs-keys=\(Array((attrs ?? [:]).keys).sorted())")
+                        if let attrs { print("  -> \(attrs)") }
+                    }
+                }
+            )
+        }
     }
 
     // MARK: - Person / capacity
 
     func probePerson(personID: String) async {
         print("--- Person \(personID) (capacity / schedule) ---")
+        // No include — working_time_schedule is not a supported include on /people
         await probeEndpoint(
             path: "/people/\(personID)",
-            query: [URLQueryItem(name: "include", value: "working_time_schedule")],
+            query: [],
             filename: "person.json",
             summary: { json in
                 let person = json["data"] as? [String: Any]
                 let attrs = person?["attributes"] as? [String: Any]
                 print("  person attrs-keys: \(Array((attrs ?? [:]).keys).sorted())")
-                // Look for capacity-related fields
                 let capacityKeys = (attrs ?? [:]).keys.filter {
                     $0.contains("capacity") || $0.contains("hour") || $0.contains("schedule")
+                    || $0.contains("availab") || $0.contains("work")
                 }
-                print("  capacity-related keys: \(capacityKeys.sorted())")
+                print("  capacity/schedule-related keys: \(capacityKeys.sorted())")
                 if let attrs { print("  -> \(attrs)") }
             }
         )
@@ -223,13 +292,9 @@ struct Probe {
         }
         print("  holiday_calendar_id: \(calendarID ?? "not found in person attrs")")
 
-        let year = Calendar.current.component(.year, from: Date())
         await probeEndpoint(
             path: "/holidays",
-            query: [
-                URLQueryItem(name: "filter[year]", value: "\(year)"),
-                URLQueryItem(name: "page[size]", value: "200")
-            ],
+            query: [URLQueryItem(name: "page[size]", value: "200")],
             filename: "holidays.json",
             summary: { json in
                 let items = (json["data"] as? [[String: Any]]) ?? []

@@ -42,14 +42,14 @@ After 1: 6 (calendar sync) is independent of 2–4 and runs in parallel.
 Sub-slices 0a–0d run in parallel after the Xcode project exists. One agent creates the
 empty project first; the rest fan out.
 
-### 0a — App shell
+### 0a — App shell ✓
 - **Depends-on:** project created
 - **Deliverable:** `App/` — `@main` app, `MenuBarExtra(style: .window)` with a placeholder
   popover, app-level state container (`@Observable`).
 - **Acceptance:** app launches, menu-bar item appears, popover opens/closes.
 - **SPEC:** App shell & UX; Architecture.
 
-### 0b — API client core
+### 0b — API client core ✓
 - **Depends-on:** project created
 - **Deliverable:** `API/` — `URLSession` client, JSON:API request/response decoding,
   `X-Auth-Token` + `X-Organization-Id` headers, **sequential write queue with 429 backoff**.
@@ -57,7 +57,7 @@ empty project first; the rest fan out.
   resource + `included`; a forced 429 triggers backoff/retry (unit test with a stub).
 - **SPEC:** Architecture; Auth; API endpoints used.
 
-### 0c — Secrets layer
+### 0c — Secrets layer ✓
 - **Depends-on:** project created
 - **Deliverable:** `Secrets/` — build-config switch: `.env` parser in DEBUG, Keychain
   read/write in RELEASE; non-secret settings in UserDefaults.
@@ -65,7 +65,7 @@ empty project first; the rest fan out.
   and retrieves a token from Keychain. No secrets logged.
 - **SPEC:** Architecture; Constants; Auth.
 
-### 0d — Models
+### 0d — Models ✓
 - **Depends-on:** project created
 - **Deliverable:** `Models/` — Codable JSON:API types: `Person`, `Service`, `Project`,
   `TimeEntry`, `Booking` (budget + absence), `Event`, `Timesheet`, `Entitlement`, `Holiday`.
@@ -75,7 +75,7 @@ empty project first; the rest fan out.
 
 ---
 
-## Slice 0.5 — API probes (discovery)
+## Slice 0.5 — API probes (discovery) ✓
 - **Depends-on:** 0b, 0c
 - **Deliverable:** `Probes/` throwaway scripts/CLI + a written **findings doc** answering
   the four open-verification questions against the **live API**, with captured sample
@@ -85,6 +85,13 @@ empty project first; the rest fan out.
   flow + state field name; (3) **capacity** exposure for daily target + percentage decomposition;
   (4) **floor × drift × minimal-diff** interaction on the two-entries-per-cell case.
 - **SPEC:** Open verification.
+
+**Findings (2026-05-28):**
+1. **Lock signal** — `approved_at` confirmed. No `deal_time_approval`. `isLocked = approved_at != null`.
+2. **Timesheet state** — Not resolved. Probe returned only `date` + `created_at`; field name open for Slice 4.
+3. **Capacity** — `availabilities` on Person: `[[start_date, end_date|null, [h_mon..h_sun], id]]`. `hours[weekday] * 60` = daily target minutes.
+4. **Booking method** — `booking_method_id` int (1=per-day via `time` field, 2=percentage via `percentage` field).
+5. **Date filter gap** — `filter[date][gte/lte]` and `filter[date_from/date_to]` both rejected on `/time_entries`, `/timesheets`, `/bookings`. Correct param names unknown; **first action of Slice 1**.
 
 ---
 
@@ -96,6 +103,8 @@ empty project first; the rest fan out.
 - **Acceptance:** real account's current-week entries and bookings render correctly across
   worked + absence rows; weekends absent; refresh re-fetches.
 - **SPEC:** Weekly grid model; App shell & UX; Productive data model.
+- **Pre-condition:** discover correct date range filter param names for `/time_entries`,
+  `/timesheets`, and `/bookings` before implementing fetches (see Slice 0.5 findings).
 
 ## Slice 2 — Prefill & target resolution
 - **Depends-on:** 1
