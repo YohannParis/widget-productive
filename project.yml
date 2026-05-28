@@ -27,7 +27,11 @@ targets:
         # EventKit (calendar sync) usage strings
         INFOPLIST_KEY_NSCalendarsFullAccessUsageDescription: "Widget Productive syncs your approved vacation to a calendar you choose."
         CODE_SIGN_STYLE: Automatic
-        CODE_SIGN_ENTITLEMENTS: WidgetProductive/WidgetProductive.entitlements
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: WidgetProductive/WidgetProductive.Debug.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: WidgetProductive/WidgetProductive.entitlements
   WidgetProductiveTests:
     type: bundle.unit-test
     platform: macOS

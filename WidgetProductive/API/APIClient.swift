@@ -43,7 +43,8 @@ struct ResourceIdentifier: Decodable {
 }
 
 /// Erased Codable wrapper for arbitrary JSON values in attributes/meta.
-struct AnyCodable: Codable {
+// @unchecked Sendable: value is always Bool/Int/Double/String/[AnyCodable]/[String:AnyCodable]/NSNull — all value types.
+struct AnyCodable: Codable, @unchecked Sendable {
     let value: Any
 
     init(_ value: some Any) { self.value = value }
@@ -80,6 +81,15 @@ struct AnyCodable: Codable {
     var bool: Bool?      { value as? Bool }
     var isNull: Bool     { value is NSNull }
 }
+
+// MARK: - Sendable conformances
+// These are needed so JSONAPIEnvelope results can cross from APIClient actor to @MainActor callers.
+
+extension ResourceIdentifier: Sendable {}
+extension RelationshipLinkage: Sendable {}
+extension RelationshipEntry: Sendable {}
+extension RawResource: Sendable {}
+extension JSONAPIEnvelope: Sendable where D: Sendable {}
 
 // MARK: - Errors
 

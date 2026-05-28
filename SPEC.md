@@ -238,17 +238,22 @@ Three distinct Productive records back the grid; do not conflate them.
   - `2` = percentage: `percentage` field × daily target ÷ 100. Field is an integer (e.g. `100`).
   - Fallback (unknown method): `total_time / total_working_days`.
   `hours` field (decimal hours/day) mirrors `time` for method 1 but is null for method 2.
-- **Date range filter syntax** — `filter[date][gte/lte]` and `filter[date_from/date_to]` are
-  both rejected (400) on `/time_entries`, `/timesheets`, and `/bookings`. Correct filter param
-  names are still unknown; to be resolved at the start of Slice 1.
+- **Date range filter syntax** — confirmed for `/time_entries` and `/bookings`:
+  `filter[after]=YYYY-MM-DD` + `filter[before]=YYYY-MM-DD`. Use Mon-1 / Fri+1 as bounds to
+  ensure inclusive semantics regardless of whether the API treats these as exclusive. The
+  `/timesheets` endpoint documents only `filter[date]` (exact match); the Grid VM tries
+  `filter[after]`/`filter[before]` first and falls back to five per-day `filter[date]` requests
+  on a 400 response.
 
 ### Still open
 
 - **Timesheet state field** — Probe returned only `date` + `created_at` attributes (no
   `status` or `state`). The state field name and transition payload for `draft → submitted`
   need to be confirmed against a live submitted/approved timesheet in Slice 4.
-- **Date range filter** — correct filter param names for `/time_entries`, `/timesheets`, and
-  `/bookings` are unknown. Must discover at the start of Slice 1 before fetching weekly data.
+- **Timesheet date filter** — `/timesheets` filter[after]/filter[before] behavior unknown.
+  VM tries range filter first; 400 triggers per-day fallback via `filter[date]`. The state
+  field name ("status" / "state") also remains unconfirmed until a live submitted/approved
+  timesheet is observed (Slice 4).
 - **Floor × drift × minimal-diff interaction** — the two-entries-per-cell case is the hotspot:
   baseline = locked floor + editable amount, and a changed approval can itself look like drift.
   Verify during Slice 3–4 implementation.

@@ -95,7 +95,7 @@ empty project first; the rest fan out.
 
 ---
 
-## Slice 1 — Read-only live grid
+## Slice 1 — Read-only live grid ✓
 - **Depends-on:** 0a, 0d, 0.5
 - **Deliverable:** `Grid/` — week navigation (past/current/future), fetch current week's
   `time_entries` + `bookings`, render Mon–Fri grid read-only. Worked rows `Project / Service`,
@@ -103,8 +103,15 @@ empty project first; the rest fan out.
 - **Acceptance:** real account's current-week entries and bookings render correctly across
   worked + absence rows; weekends absent; refresh re-fetches.
 - **SPEC:** Weekly grid model; App shell & UX; Productive data model.
-- **Pre-condition:** discover correct date range filter param names for `/time_entries`,
-  `/timesheets`, and `/bookings` before implementing fetches (see Slice 0.5 findings).
+
+**Findings (2026-05-28):**
+- Date range filter: `filter[after]` + `filter[before]` (confirmed for time_entries/bookings;
+  timesheets uses fallback per-day `filter[date]` on 400).
+- Sendable chain: `AnyCodable: @unchecked Sendable` + explicit conformances on `ResourceIdentifier`,
+  `RelationshipLinkage`, `RelationshipEntry`, `RawResource`, `JSONAPIEnvelope` (conditional on D).
+- `GridViewModel` is `@MainActor @Observable`; sequential awaits avoid cross-actor Sendability
+  issues without sacrificing correctness for Slice 1.
+- Timesheet state field name still unconfirmed; `Timesheet.isEditable` handles nil status.
 
 ## Slice 2 — Prefill & target resolution
 - **Depends-on:** 1
