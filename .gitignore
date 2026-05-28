@@ -1,2 +1,12 @@
 .env
 .DS_Store
+
+# XcodeGen-generated project (regenerate with `xcodegen generate`)
+*.xcodeproj
+
+# Xcode / SwiftPM build artifacts
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
